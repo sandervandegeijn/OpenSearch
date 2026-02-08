@@ -143,46 +143,107 @@ public class TransferManager {
 
     private static final double EVICTION_WATERMARK_RATIO = 0.9;
 
-    private static FileCachedIndexInput createIndexInput(FileCache fileCache, StreamReader streamReader, BlobFetchRequest request) {
-        try {
-            long usage = fileCache.usage();
-            long capacity = fileCache.capacity();
+    private static long getRequestedSizeBytes(BlobFetchRequest request) throws IOException {
+        long requestedSize = 0L;
+        for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {
+            try {
+                requestedSize = Math.addExact(requestedSize, blobPart.getLength());
+            } catch (ArithmeticException e) {
+                throw new IOException("BlobFetchRequest size overflow for " + request.getFilePath(), e);
+            }
+        }
+        return requestedSize;
+    }
 
-            // Soft watermark: proactively prune when approaching capacity
-            if (usage >= (long) (capacity * EVICTION_WATERMARK_RATIO)) {
+    private static void ensureCapacity(FileCache fileCache, BlobFetchRequest request, long requestedSizeBytes) throws IOException {
+        long capacity = fileCache.capacity();
+        long usage = fileCache.usage();
+        if (usage >= (long) (capacity * EVICTION_WATERMARK_RATIO)) {
+            fileCache.prune();
+            usage = fileCache.usage();
+        }
+
+        if (capacity < usage) {
+            throw new IOException(
+                "Local file cache capacity ("
+                    + capacity
+                    + ") exceeded ("
+                    + usage
+                    + ") - BlobFetchRequest failed: "
+                    + request.getFilePath()
+            );
+        }
+
+        if (requestedSizeBytes > capacity) {
+            throw new IOException(
+                "BlobFetchRequest size ("
+                    + requestedSizeBytes
+                    + ") exceeds local file cache capacity ("
+                    + capacity
+                    + "): "
+                    + request.getFilePath()
+            );
+        }
+
+    }
+
+    private static FileCache.Reservation reserveWithPrune(FileCache fileCache, BlobFetchRequest request, long requestedSizeBytes)
+        throws IOException {
+        ensureCapacity(fileCache, request, requestedSizeBytes);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            FileCache.Reservation reservation = fileCache.tryReserve(requestedSizeBytes);
+            if (reservation != null) {
+                return reservation;
+            }
+            if (attempt == 0) {
                 fileCache.prune();
             }
+        }
+        long usage = fileCache.usage();
+        long inFlight = fileCache.inFlightUsage();
+        long capacity = fileCache.capacity();
+        throw new IOException(
+            "Insufficient local file cache capacity for request bytes ("
+                + requestedSizeBytes
+                + "), usage ("
+                + usage
+                + "), in_flight ("
+                + inFlight
+                + "), capacity ("
+                + capacity
+                + "): "
+                + request.getFilePath()
+        );
+    }
 
-            // Hard limit: fail if still over capacity after pruning
-            if (capacity < fileCache.usage()) {
-                throw new IOException(
-                    "Local file cache capacity ("
-                        + capacity
-                        + ") exceeded ("
-                        + fileCache.usage()
-                        + ") - BlobFetchRequest failed: "
-                        + request.getFilePath()
-                );
-            }
+    private static FileCachedIndexInput createIndexInput(FileCache fileCache, StreamReader streamReader, BlobFetchRequest request) {
+        try {
+            long requestedSizeBytes = getRequestedSizeBytes(request);
             if (Files.exists(request.getFilePath()) == false) {
-                logger.trace("Fetching from Remote in createIndexInput of Transfer Manager");
-                try (
-                    OutputStream fileOutputStream = Files.newOutputStream(request.getFilePath());
-                    OutputStream localFileOutputStream = new BufferedOutputStream(fileOutputStream)
-                ) {
-                    for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {
-                        try (
-                            InputStream snapshotFileInputStream = streamReader.read(
-                                blobPart.getBlobName(),
-                                blobPart.getPosition(),
-                                blobPart.getLength()
-                            );
-                        ) {
-                            snapshotFileInputStream.transferTo(localFileOutputStream);
+                try (FileCache.Reservation reservation = reserveWithPrune(fileCache, request, requestedSizeBytes)) {
+                    logger.trace("Fetching from Remote in createIndexInput of Transfer Manager");
+                    try (
+                        OutputStream fileOutputStream = Files.newOutputStream(request.getFilePath());
+                        OutputStream localFileOutputStream = new BufferedOutputStream(fileOutputStream)
+                    ) {
+                        for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {
+                            try (
+                                InputStream snapshotFileInputStream = streamReader.read(
+                                    blobPart.getBlobName(),
+                                    blobPart.getPosition(),
+                                    blobPart.getLength()
+                                );
+                            ) {
+                                snapshotFileInputStream.transferTo(localFileOutputStream);
+                            }
                         }
                     }
+                } catch (IOException | RuntimeException e) {
+                    Files.deleteIfExists(request.getFilePath());
+                    throw e;
                 }
             }
+            ensureCapacity(fileCache, request, 0L);
             final IndexInput luceneIndexInput = request.getDirectory().openInput(request.getFileName(), IOContext.DEFAULT);
             return new FileCachedIndexInput(fileCache, request.getFilePath(), luceneIndexInput);
         } catch (IOException e) {

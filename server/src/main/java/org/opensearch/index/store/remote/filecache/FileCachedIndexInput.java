@@ -89,72 +89,72 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
 
     @Override
     public long getFilePointer() {
-        return luceneIndexInput.getFilePointer();
+        return getLuceneIndexInputOrThrow().getFilePointer();
     }
 
     @Override
     public void seek(long pos) throws IOException {
-        luceneIndexInput.seek(pos);
+        getLuceneIndexInputOrThrow().seek(pos);
     }
 
     @Override
     public long length() {
-        return luceneIndexInput.length();
+        return getLuceneIndexInputOrThrow().length();
     }
 
     @Override
     public byte readByte() throws IOException {
-        return luceneIndexInput.readByte();
+        return getLuceneIndexInputOrThrow().readByte();
     }
 
     @Override
     public short readShort() throws IOException {
-        return luceneIndexInput.readShort();
+        return getLuceneIndexInputOrThrow().readShort();
     }
 
     @Override
     public int readInt() throws IOException {
-        return luceneIndexInput.readInt();
+        return getLuceneIndexInputOrThrow().readInt();
     }
 
     @Override
     public long readLong() throws IOException {
-        return luceneIndexInput.readLong();
+        return getLuceneIndexInputOrThrow().readLong();
     }
 
     @Override
     public final int readVInt() throws IOException {
-        return luceneIndexInput.readVInt();
+        return getLuceneIndexInputOrThrow().readVInt();
     }
 
     @Override
     public final long readVLong() throws IOException {
-        return luceneIndexInput.readVLong();
+        return getLuceneIndexInputOrThrow().readVLong();
     }
 
     @Override
     public void readBytes(byte[] b, int offset, int len) throws IOException {
-        luceneIndexInput.readBytes(b, offset, len);
+        getLuceneIndexInputOrThrow().readBytes(b, offset, len);
     }
 
     @Override
     public byte readByte(long pos) throws IOException {
-        return ((RandomAccessInput) luceneIndexInput).readByte(pos);
+        return ((RandomAccessInput) getLuceneIndexInputOrThrow()).readByte(pos);
     }
 
     @Override
     public short readShort(long pos) throws IOException {
-        return ((RandomAccessInput) luceneIndexInput).readShort(pos);
+        return ((RandomAccessInput) getLuceneIndexInputOrThrow()).readShort(pos);
     }
 
     @Override
     public int readInt(long pos) throws IOException {
-        return ((RandomAccessInput) luceneIndexInput).readInt(pos);
+        return ((RandomAccessInput) getLuceneIndexInputOrThrow()).readInt(pos);
     }
 
     @Override
     public long readLong(long pos) throws IOException {
-        return ((RandomAccessInput) luceneIndexInput).readLong(pos);
+        return ((RandomAccessInput) getLuceneIndexInputOrThrow()).readLong(pos);
     }
 
     @Override
@@ -173,17 +173,20 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
     @Override
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            if (isClone) {
-                cache.decRef(filePath);
-            }
-            IndexInput toClose = luceneIndexInput;
-            luceneIndexInput = null;
+            IndexInput toClose = getLuceneIndexInputOrThrow();
             if (toClose != null) {
                 try {
                     toClose.close();
                 } catch (AlreadyClosedException e) {
                     logger.trace("FileCachedIndexInput already closed");
+                } catch (IOException e) {
+                    closed.set(false);
+                    throw e;
                 }
+            }
+            luceneIndexInput = null;
+            if (isClone) {
+                cache.decRef(filePath);
             }
         }
     }
@@ -191,7 +194,7 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
     /**
      * Run resource cleaning. To be used only in test.
      */
-    public void indexInputHolderRun() {
+    void indexInputHolderRun() {
         if (indexInputHolder != null) {
             indexInputHolder.run();
         }
@@ -228,11 +231,12 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
                 } catch (AlreadyClosedException e) {
                     logger.trace("FileCachedIndexInput already closed by cleaner");
                 } catch (IOException e) {
+                    closed.set(false);
                     logger.error("Failed to close IndexInput while clearing phantom reachable object", e);
-                } finally {
-                    if (isClone) {
-                        cache.decRef(path);
-                    }
+                    return;
+                }
+                if (isClone) {
+                    cache.decRef(path);
                 }
             }
         }

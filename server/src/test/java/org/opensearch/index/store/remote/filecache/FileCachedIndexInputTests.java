@@ -23,6 +23,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FileCachedIndexInputTests extends OpenSearchTestCase {
 
@@ -164,6 +168,34 @@ public class FileCachedIndexInputTests extends OpenSearchTestCase {
         setupIndexInputAndAddToFileCache();
         fileCachedIndexInput.close();
         assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.clone());
+    }
+
+    public void testReadsAfterCloseThrowAlreadyClosed() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fileCachedIndexInput.close();
+        assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.getFilePointer());
+        assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.seek(0));
+        assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.length());
+        assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.readByte());
+    }
+
+    public void testCloseFailureDoesNotDecRefAndCanRetry() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fileCache.decRef(filePath);
+
+        IndexInput mockedInput = mock(IndexInput.class);
+        doThrow(new IOException("close failed once")).doNothing().when(mockedInput).close();
+
+        FileCachedIndexInput cloneIndexInput = new FileCachedIndexInput(fileCache, filePath, mockedInput, true);
+        fileCache.incRef(filePath);
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        IOException firstCloseException = assertThrows(IOException.class, cloneIndexInput::close);
+        assertEquals("close failed once", firstCloseException.getMessage());
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        cloneIndexInput.close();
+        assertEquals(0, (int) fileCache.getRef(filePath));
     }
 
     protected boolean isActiveAndTotalUsageSame() {

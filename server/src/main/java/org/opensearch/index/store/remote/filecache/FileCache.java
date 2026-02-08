@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.index.store.remote.filecache.AggregateFileCacheStats.FileCacheStatsType;
@@ -28,6 +29,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.RecursiveAction;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
@@ -59,6 +62,7 @@ import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLD
 public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
     private static final Logger logger = LogManager.getLogger(FileCache.class);
     private final SegmentedCache<Path, CachedIndexInput> theCache;
+    private final AtomicLong inFlightUsage = new AtomicLong(0L);
 
     private final CircuitBreaker circuitBreaker = null;
 
@@ -76,6 +80,53 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
 
     public long capacity() {
         return theCache.capacity();
+    }
+
+    /**
+     * Returns the currently reserved in-flight bytes for file cache writes.
+     */
+    public long inFlightUsage() {
+        return inFlightUsage.get();
+    }
+
+    /**
+     * Attempts to reserve bytes against the file cache capacity.
+     *
+     * @return a reservation if successful; otherwise {@code null}.
+     */
+    public Reservation tryReserve(long bytes) {
+        if (bytes < 0L) {
+            throw new IllegalArgumentException("bytes must be non-negative");
+        }
+        if (bytes == 0L) {
+            return Reservation.NOOP;
+        }
+        final long cacheCapacity = capacity();
+        if (bytes > cacheCapacity) {
+            return null;
+        }
+        while (true) {
+            final long usage = usage();
+            final long inFlight = inFlightUsage.get();
+            final long available = cacheCapacity - usage - inFlight;
+            if (available < bytes) {
+                return null;
+            }
+            if (inFlightUsage.compareAndSet(inFlight, inFlight + bytes)) {
+                return new Reservation(this, bytes);
+            }
+        }
+    }
+
+    private void releaseReservation(long bytes) {
+        if (bytes == 0L) {
+            return;
+        }
+        long remaining = inFlightUsage.addAndGet(-bytes);
+        if (remaining < 0L) {
+            inFlightUsage.set(0L);
+            logger.warn("File cache in-flight reservation dropped below zero while releasing {} bytes", bytes);
+        }
     }
 
     @Override
@@ -331,6 +382,44 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
 
         @Override
         public void close() throws Exception {}
+    }
+
+    /**
+     * Reservation handle for in-flight file cache bytes.
+     */
+    @ExperimentalApi
+    public static final class Reservation implements AutoCloseable {
+        private static final Reservation NOOP = new Reservation();
+        private final FileCache fileCache;
+        private final long bytes;
+        private final AtomicBoolean released;
+
+        private Reservation() {
+            this.fileCache = null;
+            this.bytes = 0L;
+            this.released = new AtomicBoolean(true);
+        }
+
+        private Reservation(FileCache fileCache, long bytes) {
+            this.fileCache = fileCache;
+            this.bytes = bytes;
+            this.released = new AtomicBoolean(false);
+        }
+
+        public long bytes() {
+            return bytes;
+        }
+
+        public void release() {
+            if (released.compareAndSet(false, true) && fileCache != null) {
+                fileCache.releaseReservation(bytes);
+            }
+        }
+
+        @Override
+        public void close() {
+            release();
+        }
     }
 
     /**

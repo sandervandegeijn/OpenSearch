@@ -11,10 +11,15 @@ package org.opensearch.index.store.remote.filecache;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.IndexInput;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
+
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FullFileCachedIndexInputTests extends FileCachedIndexInputTests {
@@ -123,6 +128,25 @@ public class FullFileCachedIndexInputTests extends FileCachedIndexInputTests {
         setupIndexInputAndAddToFileCache();
         fullFileCachedIndexInput.close();
         assertThrows(AlreadyClosedException.class, () -> fullFileCachedIndexInput.slice("slice", 0, 1));
+    }
+
+    public void testCloseFailureDoesNotDecRefAndCanRetry() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fileCache.decRef(filePath);
+
+        IndexInput mockedInput = mock(IndexInput.class);
+        doThrow(new IOException("close failed once")).doNothing().when(mockedInput).close();
+
+        FullFileCachedIndexInput cloneIndexInput = new FullFileCachedIndexInput(fileCache, filePath, mockedInput, true);
+        fileCache.incRef(filePath);
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        IOException firstCloseException = assertThrows(IOException.class, cloneIndexInput::close);
+        assertEquals("close failed once", firstCloseException.getMessage());
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        cloneIndexInput.close();
+        assertEquals(0, (int) fileCache.getRef(filePath));
     }
 
     private void triggerGarbageCollectionAndAssertClonesClosed() {

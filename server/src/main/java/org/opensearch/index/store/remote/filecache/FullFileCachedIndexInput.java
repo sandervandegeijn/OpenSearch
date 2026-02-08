@@ -89,17 +89,20 @@ public class FullFileCachedIndexInput extends FileCachedIndexInput {
     @Override
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            if (isClone) {
-                cache.decRef(filePath);
-            }
-            IndexInput toClose = luceneIndexInput;
-            luceneIndexInput = null;
+            IndexInput toClose = getLuceneIndexInputOrThrow();
             if (toClose != null) {
                 try {
                     toClose.close();
                 } catch (AlreadyClosedException e) {
                     logger.trace("FullFileCachedIndexInput already closed");
+                } catch (IOException e) {
+                    closed.set(false);
+                    throw e;
                 }
+            }
+            luceneIndexInput = null;
+            if (isClone) {
+                cache.decRef(filePath);
             }
         }
     }
@@ -107,7 +110,7 @@ public class FullFileCachedIndexInput extends FileCachedIndexInput {
     /**
      * Run resource cleaning，To be used only in test
      */
-    public void indexInputHolderRun() {
+    void indexInputHolderRun() {
         if (indexInputHolder != null) {
             indexInputHolder.run();
         }
@@ -136,11 +139,12 @@ public class FullFileCachedIndexInput extends FileCachedIndexInput {
                 } catch (AlreadyClosedException e) {
                     logger.trace("FullFileCachedIndexInput already closed by cleaner");
                 } catch (IOException e) {
+                    closed.set(false);
                     logger.error("Failed to close IndexInput while clearing phantom reachable object", e);
-                } finally {
-                    if (isClone) {
-                        cache.decRef(path);
-                    }
+                    return;
+                }
+                if (isClone) {
+                    cache.decRef(path);
                 }
             }
         }

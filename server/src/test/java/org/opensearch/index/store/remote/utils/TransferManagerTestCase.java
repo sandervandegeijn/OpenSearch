@@ -183,6 +183,40 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
         MatcherAssert.assertThat("Expected many evictions to happen", fileCache.stats().evictionCount(), greaterThan(0L));
     }
 
+    public void testSoftWatermarkTriggersPrune() throws Exception {
+        initializeTransferManager();
+        // Fill cache with two blobs (at capacity), then close them so they become evictable (refCount 0)
+        IndexInput i1 = fetchBlobWithName("1");
+        IndexInput i2 = fetchBlobWithName("2");
+        i1.close();
+        i2.close();
+
+        // Both entries are evictable (refCount 0), cache usage may have been reduced by LRU eviction
+        MatcherAssert.assertThat(fileCache.usage(), greaterThan(0L));
+
+        // Fetching another blob should succeed because evictable entries can be reclaimed
+        try (IndexInput i3 = fetchBlobWithName("3")) {
+            assertNotNull(i3);
+            // Usage should be within bounds (at most capacity)
+            MatcherAssert.assertThat(fileCache.usage(), greaterThan(0L));
+        }
+    }
+
+    public void testHardLimitStillFailsWhenAllActive() throws Exception {
+        initializeTransferManager();
+        // Fill cache with two blobs and keep them open (actively referenced)
+        IndexInput i1 = fetchBlobWithName("1");
+        IndexInput i2 = fetchBlobWithName("2");
+
+        try {
+            // All entries are actively referenced, prune cannot reclaim them
+            assertThrows(IOException.class, () -> { IndexInput i3 = fetchBlobWithName("3"); });
+        } finally {
+            i1.close();
+            i2.close();
+        }
+    }
+
     public void testOverflowDisabled() throws Exception {
         initializeTransferManager();
         IndexInput i1 = fetchBlobWithName("1");

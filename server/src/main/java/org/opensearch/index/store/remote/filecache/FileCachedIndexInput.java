@@ -8,10 +8,16 @@
 
 package org.opensearch.index.store.remote.filecache;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 
 import java.io.IOException;
+import java.lang.ref.Cleaner;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -22,9 +28,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Every time a clone is closed, RC - 1.
  * When there is an eviction in FileCache, it only cleanups those origins with RC = 0.
  *
+ * Since Lucene does not guarantee that it will close clones, a {@link java.lang.ref.Cleaner} is
+ * used to handle closing of clones when they become phantom reachable.
+ * https://github.com/apache/lucene/blob/8340b01c/lucene/core/src/java/org/apache/lucene/store/IndexInput.java#L32-L33
+ *
  * @opensearch.internal
  */
 public class FileCachedIndexInput extends IndexInput implements RandomAccessInput {
+    private static final Logger logger = LogManager.getLogger(FileCachedIndexInput.class);
+    static final Cleaner CLEANER = Cleaner.create(
+        OpenSearchExecutors.daemonThreadFactory(AbstractBlockIndexInput.CLEANER_THREAD_NAME_PREFIX)
+    );
 
     protected final FileCache cache;
 
@@ -44,16 +58,33 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
 
     protected final AtomicBoolean closed = new AtomicBoolean(false);
 
+    private final IndexInputHolder indexInputHolder;
+
     public FileCachedIndexInput(FileCache cache, Path filePath, IndexInput underlyingIndexInput) {
         this(cache, filePath, underlyingIndexInput, false);
     }
 
     FileCachedIndexInput(FileCache cache, Path filePath, IndexInput underlyingIndexInput, boolean isClone) {
+        this(cache, filePath, underlyingIndexInput, isClone, true);
+    }
+
+    /**
+     * Package-private constructor that optionally registers with the Cleaner.
+     * Subclasses that manage their own Cleaner (e.g. {@link FullFileCachedIndexInput})
+     * should pass {@code registerCleaner = false} to avoid double registration.
+     */
+    FileCachedIndexInput(FileCache cache, Path filePath, IndexInput underlyingIndexInput, boolean isClone, boolean registerCleaner) {
         super("FileCachedIndexInput (path=" + filePath.toString() + ")");
         this.cache = cache;
         this.filePath = filePath;
         this.luceneIndexInput = underlyingIndexInput;
         this.isClone = isClone;
+        if (registerCleaner) {
+            this.indexInputHolder = new IndexInputHolder(closed, underlyingIndexInput, isClone, cache, filePath);
+            CLEANER.register(this, indexInputHolder);
+        } else {
+            this.indexInputHolder = null;
+        }
     }
 
     @Override
@@ -128,8 +159,9 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
 
     @Override
     public FileCachedIndexInput clone() {
+        FileCachedIndexInput clonedIndexInput = new FileCachedIndexInput(cache, filePath, getLuceneIndexInputOrThrow().clone(), true);
         cache.incRef(filePath);
-        return new FileCachedIndexInput(cache, filePath, luceneIndexInput.clone(), true);
+        return clonedIndexInput;
     }
 
     @Override
@@ -140,16 +172,69 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
 
     @Override
     public void close() throws IOException {
-        if (!closed.get()) {
-            // if the underlying lucene index input is a clone,
-            // the following line won't close/unmap the file.
-            luceneIndexInput.close();
-            luceneIndexInput = null;
-            // origin never reference it itself, only clone needs decRef here
+        if (closed.compareAndSet(false, true)) {
             if (isClone) {
                 cache.decRef(filePath);
             }
-            closed.set(true);
+            IndexInput toClose = luceneIndexInput;
+            luceneIndexInput = null;
+            if (toClose != null) {
+                try {
+                    toClose.close();
+                } catch (AlreadyClosedException e) {
+                    logger.trace("FileCachedIndexInput already closed");
+                }
+            }
+        }
+    }
+
+    /**
+     * Run resource cleaning. To be used only in test.
+     */
+    public void indexInputHolderRun() {
+        if (indexInputHolder != null) {
+            indexInputHolder.run();
+        }
+    }
+
+    protected IndexInput getLuceneIndexInputOrThrow() {
+        IndexInput input = luceneIndexInput;
+        if (input == null) {
+            throw new AlreadyClosedException("FileCachedIndexInput is closed");
+        }
+        return input;
+    }
+
+    private static class IndexInputHolder implements Runnable {
+        private final AtomicBoolean closed;
+        private final IndexInput indexInput;
+        private final FileCache cache;
+        private final boolean isClone;
+        private final Path path;
+
+        IndexInputHolder(AtomicBoolean closed, IndexInput indexInput, boolean isClone, FileCache cache, Path path) {
+            this.closed = closed;
+            this.indexInput = indexInput;
+            this.isClone = isClone;
+            this.cache = cache;
+            this.path = path;
+        }
+
+        @Override
+        public void run() {
+            if (closed.compareAndSet(false, true)) {
+                try {
+                    indexInput.close();
+                } catch (AlreadyClosedException e) {
+                    logger.trace("FileCachedIndexInput already closed by cleaner");
+                } catch (IOException e) {
+                    logger.error("Failed to close IndexInput while clearing phantom reachable object", e);
+                } finally {
+                    if (isClone) {
+                        cache.decRef(path);
+                    }
+                }
+            }
         }
     }
 }

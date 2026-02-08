@@ -12,6 +12,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
@@ -20,6 +21,7 @@ import org.junit.Before;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FileCachedIndexInputTests extends OpenSearchTestCase {
@@ -27,7 +29,7 @@ public class FileCachedIndexInputTests extends OpenSearchTestCase {
     protected FileCache fileCache;
     protected Path filePath;
     protected IndexInput underlyingIndexInput;
-    private FileCachedIndexInput fileCachedIndexInput;
+    protected FileCachedIndexInput fileCachedIndexInput;
 
     protected static final int FILE_CACHE_CAPACITY = 1000;
     protected static final String TEST_FILE = "test_file";
@@ -73,6 +75,95 @@ public class FileCachedIndexInputTests extends OpenSearchTestCase {
     public void testSlice() throws IOException {
         setupIndexInputAndAddToFileCache();
         assertThrows(UnsupportedOperationException.class, () -> fileCachedIndexInput.slice(SLICE_DESC, 10, 100));
+    }
+
+    public void testCleanerDecRefsOnGC() {
+        setupIndexInputAndAddToFileCache();
+
+        // Drop the put refCount so it starts at 0
+        fileCache.decRef(filePath);
+        assertEquals(0, (int) fileCache.getRef(filePath));
+
+        // Create a clone (refCount becomes 1), then drop the reference without closing
+        fileCachedIndexInput.clone();
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        // Trigger GC and assert the Cleaner decrements refCount back to 0
+        try {
+            assertBusy(() -> {
+                System.gc();
+                assertEquals("Expected refCount to drop to zero after GC cleans up unclosed clone", 0, (int) fileCache.getRef(filePath));
+            }, 5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            logger.error("Exception thrown while triggering gc", e);
+            fail("GC-based cleaner test failed: " + e.getMessage());
+        }
+    }
+
+    public void testCloseAndCleanerIdempotent() throws IOException {
+        setupIndexInputAndAddToFileCache();
+
+        // Drop the put refCount so it starts at 0
+        fileCache.decRef(filePath);
+
+        // Create 3 clones
+        FileCachedIndexInput clone1 = fileCachedIndexInput.clone();
+        FileCachedIndexInput clone2 = fileCachedIndexInput.clone();
+        FileCachedIndexInput clone3 = fileCachedIndexInput.clone();
+        assertEquals(3, (int) fileCache.getRef(filePath));
+
+        // Close clone1, then invoke cleaner — refCount should only decrement once
+        clone1.close();
+        assertEquals(2, (int) fileCache.getRef(filePath));
+        clone1.indexInputHolderRun();
+        assertEquals(2, (int) fileCache.getRef(filePath));
+
+        // Invoke cleaner on clone2 first, then close — refCount should only decrement once
+        clone2.indexInputHolderRun();
+        assertEquals(1, (int) fileCache.getRef(filePath));
+        clone2.close();
+        assertEquals(1, (int) fileCache.getRef(filePath));
+
+        // Close clone3, then invoke cleaner
+        clone3.close();
+        assertEquals(0, (int) fileCache.getRef(filePath));
+        clone3.indexInputHolderRun();
+        assertEquals(0, (int) fileCache.getRef(filePath));
+    }
+
+    public void testMultipleUnclosedClones() {
+        setupIndexInputAndAddToFileCache();
+
+        // Drop the put refCount so it starts at 0
+        fileCache.decRef(filePath);
+        assertEquals(0, (int) fileCache.getRef(filePath));
+
+        int numClones = 5;
+        for (int i = 0; i < numClones; i++) {
+            fileCachedIndexInput.clone();
+        }
+        assertEquals(numClones, (int) fileCache.getRef(filePath));
+
+        // Trigger GC and assert all clones get cleaned up
+        try {
+            assertBusy(() -> {
+                System.gc();
+                assertEquals(
+                    "Expected refCount to drop to zero after GC cleans up all unclosed clones",
+                    0,
+                    (int) fileCache.getRef(filePath)
+                );
+            }, 5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            logger.error("Exception thrown while triggering gc", e);
+            fail("GC-based cleaner test failed: " + e.getMessage());
+        }
+    }
+
+    public void testCloneAfterCloseThrows() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fileCachedIndexInput.close();
+        assertThrows(AlreadyClosedException.class, () -> fileCachedIndexInput.clone());
     }
 
     protected boolean isActiveAndTotalUsageSame() {

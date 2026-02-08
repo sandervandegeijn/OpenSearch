@@ -23,6 +23,7 @@ public class FullFileCachedIndexInputTests extends FileCachedIndexInputTests {
     @Override
     protected void setupIndexInputAndAddToFileCache() {
         fullFileCachedIndexInput = new FullFileCachedIndexInput(fileCache, filePath, underlyingIndexInput);
+        fileCachedIndexInput = fullFileCachedIndexInput;
         // Putting in the file cache would increase refCount to 1
         fileCache.put(filePath, new CachedFullFileIndexInput(fileCache, filePath, fullFileCachedIndexInput));
     }
@@ -110,6 +111,18 @@ public class FullFileCachedIndexInputTests extends FileCachedIndexInputTests {
         assertEquals((int) fileCache.getRef(filePath), 0);
         indexInputClone3.indexInputHolderRun();
         assertEquals((int) fileCache.getRef(filePath), 0);
+    }
+
+    public void testCloneAfterCloseThrows() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fullFileCachedIndexInput.close();
+        assertThrows(AlreadyClosedException.class, () -> fullFileCachedIndexInput.clone());
+    }
+
+    public void testSliceAfterCloseThrows() throws IOException {
+        setupIndexInputAndAddToFileCache();
+        fullFileCachedIndexInput.close();
+        assertThrows(AlreadyClosedException.class, () -> fullFileCachedIndexInput.slice("slice", 0, 1));
     }
 
     private void triggerGarbageCollectionAndAssertClonesClosed() {

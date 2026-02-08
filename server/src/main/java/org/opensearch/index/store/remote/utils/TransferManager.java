@@ -141,15 +141,23 @@ public class TransferManager {
         }
     }
 
+    private static final double EVICTION_WATERMARK_RATIO = 0.9;
+
     private static FileCachedIndexInput createIndexInput(FileCache fileCache, StreamReader streamReader, BlobFetchRequest request) {
         try {
-            // This local file cache is ref counted and may not strictly enforce configured capacity.
-            // If we find available capacity is exceeded, deny further BlobFetchRequests.
-            if (fileCache.capacity() < fileCache.usage()) {
+            long usage = fileCache.usage();
+            long capacity = fileCache.capacity();
+
+            // Soft watermark: proactively prune when approaching capacity
+            if (usage >= (long) (capacity * EVICTION_WATERMARK_RATIO)) {
                 fileCache.prune();
+            }
+
+            // Hard limit: fail if still over capacity after pruning
+            if (capacity < fileCache.usage()) {
                 throw new IOException(
                     "Local file cache capacity ("
-                        + fileCache.capacity()
+                        + capacity
                         + ") exceeded ("
                         + fileCache.usage()
                         + ") - BlobFetchRequest failed: "

@@ -26,12 +26,21 @@ import org.junit.Before;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FileCacheTests extends OpenSearchTestCase {
@@ -351,6 +360,121 @@ public class FileCacheTests extends OpenSearchTestCase {
 
         assertEquals(expectedCacheUsage, realCacheUsage);
         assertEquals(expectedActiveCacheUsage, realActiveCacheUsage);
+    }
+
+    public void testTryReserveRejectsNegativeBytes() {
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        IllegalArgumentException exception = expectThrows(IllegalArgumentException.class, () -> fileCache.tryReserve(-1L));
+        assertEquals("bytes must be non-negative", exception.getMessage());
+        assertEquals(0L, fileCache.inFlightUsage());
+    }
+
+    public void testTryReserveZeroBytesReturnsNoopAndDoesNotAffectInFlight() {
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        FileCache.Reservation reservation = fileCache.tryReserve(0L);
+        assertNotNull(reservation);
+        assertEquals(0L, reservation.bytes());
+        assertEquals(0L, fileCache.inFlightUsage());
+
+        reservation.release();
+        reservation.close();
+        assertEquals(0L, fileCache.inFlightUsage());
+    }
+
+    public void testTryReserveRejectsBytesAboveCapacity() {
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        assertNull(fileCache.tryReserve(MEGA_BYTES + 1L));
+        assertEquals(0L, fileCache.inFlightUsage());
+    }
+
+    public void testTryReserveAccountsForUsageAndInFlight() {
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10 * MEGA_BYTES, 1);
+        putAndDecRef(fileCache, 0, 6 * MEGA_BYTES);
+        assertEquals(6L * MEGA_BYTES, fileCache.usage());
+
+        FileCache.Reservation firstReservation = fileCache.tryReserve(3 * MEGA_BYTES);
+        assertNotNull(firstReservation);
+        assertEquals(3L * MEGA_BYTES, fileCache.inFlightUsage());
+
+        assertNull(fileCache.tryReserve(2 * MEGA_BYTES));
+        assertEquals(3L * MEGA_BYTES, fileCache.inFlightUsage());
+
+        firstReservation.close();
+        assertEquals(0L, fileCache.inFlightUsage());
+        FileCache.Reservation secondReservation = fileCache.tryReserve(2 * MEGA_BYTES);
+        assertNotNull(secondReservation);
+        secondReservation.close();
+    }
+
+    public void testReservationReleaseIsIdempotent() {
+        FileCache fileCache = createFileCache(2 * MEGA_BYTES);
+        FileCache.Reservation reservation = fileCache.tryReserve(MEGA_BYTES);
+        assertNotNull(reservation);
+        assertEquals(MEGA_BYTES, fileCache.inFlightUsage());
+
+        reservation.release();
+        assertEquals(0L, fileCache.inFlightUsage());
+        reservation.release();
+        reservation.close();
+        assertEquals(0L, fileCache.inFlightUsage());
+    }
+
+    public void testTryReserveConcurrentSingleWinnerAtCapacity() throws Exception {
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        int workers = 8;
+        CyclicBarrier barrier = new CyclicBarrier(workers);
+        CountDownLatch doneLatch = new CountDownLatch(workers);
+        CountDownLatch releaseReservationsLatch = new CountDownLatch(1);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        ConcurrentLinkedQueue<FileCache.Reservation> reservations = new ConcurrentLinkedQueue<>();
+        ExecutorService executor = Executors.newFixedThreadPool(workers);
+        try {
+            for (int i = 0; i < workers; i++) {
+                executor.execute(() -> {
+                    try {
+                        barrier.await(10, TimeUnit.SECONDS);
+                        FileCache.Reservation reservation = fileCache.tryReserve(MEGA_BYTES);
+                        if (reservation != null) {
+                            successCount.incrementAndGet();
+                            reservations.add(reservation);
+                        }
+                        assertTrue(releaseReservationsLatch.await(10, TimeUnit.SECONDS));
+                    } catch (Exception e) {
+                        failure.compareAndSet(null, e);
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+            assertBusy(() -> assertEquals(1, successCount.get()));
+            releaseReservationsLatch.countDown();
+            assertTrue(doneLatch.await(30, TimeUnit.SECONDS));
+            assertNull(failure.get());
+            assertEquals(1, successCount.get());
+            for (FileCache.Reservation reservation : reservations) {
+                reservation.close();
+            }
+            assertEquals(0L, fileCache.inFlightUsage());
+        } finally {
+            terminate(executor);
+        }
+    }
+
+    public void testReleaseReservationHandlesZeroAndNegativeRollover() throws Exception {
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        Method releaseReservation = FileCache.class.getDeclaredMethod("releaseReservation", long.class);
+        releaseReservation.setAccessible(true);
+
+        releaseReservation.invoke(fileCache, 0L);
+        assertEquals(0L, fileCache.inFlightUsage());
+
+        FileCache.Reservation reservation = fileCache.tryReserve(1L);
+        assertNotNull(reservation);
+        assertEquals(1L, fileCache.inFlightUsage());
+
+        releaseReservation.invoke(fileCache, 2L);
+        assertEquals(0L, fileCache.inFlightUsage());
     }
 
     public void testStats() {

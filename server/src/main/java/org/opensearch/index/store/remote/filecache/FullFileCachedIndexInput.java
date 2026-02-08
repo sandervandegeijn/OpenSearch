@@ -90,15 +90,13 @@ public class FullFileCachedIndexInput extends FileCachedIndexInput {
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
             IndexInput toClose = getLuceneIndexInputOrThrow();
-            if (toClose != null) {
-                try {
-                    toClose.close();
-                } catch (AlreadyClosedException e) {
-                    logger.trace("FullFileCachedIndexInput already closed");
-                } catch (IOException e) {
-                    closed.set(false);
-                    throw e;
-                }
+            try {
+                toClose.close();
+            } catch (AlreadyClosedException e) {
+                logger.trace("FullFileCachedIndexInput already closed");
+            } catch (IOException e) {
+                closed.set(false);
+                throw e;
             }
             luceneIndexInput = null;
             if (isClone) {

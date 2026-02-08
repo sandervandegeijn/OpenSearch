@@ -174,15 +174,13 @@ public class FileCachedIndexInput extends IndexInput implements RandomAccessInpu
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
             IndexInput toClose = getLuceneIndexInputOrThrow();
-            if (toClose != null) {
-                try {
-                    toClose.close();
-                } catch (AlreadyClosedException e) {
-                    logger.trace("FileCachedIndexInput already closed");
-                } catch (IOException e) {
-                    closed.set(false);
-                    throw e;
-                }
+            try {
+                toClose.close();
+            } catch (AlreadyClosedException e) {
+                logger.trace("FileCachedIndexInput already closed");
+            } catch (IOException e) {
+                closed.set(false);
+                throw e;
             }
             luceneIndexInput = null;
             if (isClone) {
